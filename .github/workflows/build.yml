@@ -23,6 +23,9 @@
 # transport artifacts (1 day retention, deleted again once the release is
 # published) — the actual deliverable is the GitHub Release.
 #
+# Forks are no-ops: every job is gated on github.repository, so only runs in
+# Mitra-88/7zip build binaries and publish releases.
+#
 # Optimization flags are injected through hooks the makefiles already provide
 # (no source/makefile edits; see comments per job). x86-64 targets use the
 # x86-64-v3 baseline (AVX2/BMI2/FMA/LZCNT/MOVBE/F16C — needs Intel Haswell
@@ -65,6 +68,7 @@ jobs:
     name: Windows x64 (MSVC, /arch:AVX2 = x86-64-v3)
     runs-on: windows-2025
     timeout-minutes: 30
+    if: github.repository == 'Mitra-88/7zip'
     steps:
       - name: Checkout
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -93,7 +97,7 @@ jobs:
           Copy-Item DOC/License.txt dist/
 
       - name: Upload (transport to release job)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: 7zz-windows-x64-v3
           path: dist/
@@ -119,6 +123,7 @@ jobs:
     name: Linux x64 (GCC, -march=x86-64-v3)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    if: github.repository == 'Mitra-88/7zip'
     steps:
       - name: Checkout
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -141,7 +146,7 @@ jobs:
           cp DOC/License.txt dist/
 
       - name: Upload (transport to release job)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: 7zz-linux-x64-v3
           path: dist/
@@ -162,6 +167,7 @@ jobs:
     name: macOS arm64 (Apple clang, -mcpu=apple-m1)
     runs-on: macos-26
     timeout-minutes: 30
+    if: github.repository == 'Mitra-88/7zip'
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
@@ -187,7 +193,7 @@ jobs:
           cp DOC/License.txt dist/
 
       - name: Upload (transport to release job)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: 7zz-macos-arm64
           path: dist/
@@ -206,6 +212,7 @@ jobs:
     needs: [windows-x64, linux-x64, macos-arm64]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
+    if: github.repository == 'Mitra-88/7zip'
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
