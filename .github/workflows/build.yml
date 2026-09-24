@@ -263,7 +263,7 @@ jobs:
           cat > body.md <<EOF
           **Rolling Release**
           * **Base Version:** \`${BASE_VERSION}\`
-          * **Build Number:** #${GITHUB_RUN_NUMBER}
+          * **Build Number:** [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
           * **Branch:** [\`${GITHUB_REF_NAME}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME})
           * **Commit:** [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
           * **Built on:** ${BUILD_DATE}
