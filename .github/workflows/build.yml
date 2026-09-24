@@ -1,0 +1,295 @@
+# Builds the 7-Zip console version ("7zz" — the standalone console binary with
+# all codecs compiled in) for Windows x64, Linux x64 and macOS arm64, and
+# publishes the result as ONE rolling "nightly" GitHub Release that is
+# replaced on every run (release tag: `nightly`).
+#
+# Triggers:
+#   * schedule   — every day at 03:00 UTC (nightly)
+#   * workflow_dispatch — manual trigger (Actions tab -> Run workflow)
+#
+# Runners are pinned to the documented images:
+#   * windows-2025  — VS Enterprise 2026 18.9 (MSVC 14.51 toolset)
+#   * ubuntu-26.04  — GCC 15.2, make, zip, file preinstalled
+#   * macos-26      — Xcode 26.6 / Apple clang 21 (arm64)
+# Nothing needs to be installed on any runner.
+#
+# Toolchains: Windows = MSVC (cl), Linux = GCC, macOS = Apple clang.
+# Compiler option references:
+#   MSVC : https://learn.microsoft.com/en-us/cpp/build/reference/compiler-options
+#   Clang: https://clang.llvm.org/docs/ClangCommandLineReference.html
+#   GCC  : https://gcc.gnu.org/onlinedocs/
+#
+# The three build jobs hand their binaries to the release job via short-lived
+# transport artifacts (1 day retention, deleted again once the release is
+# published) — the actual deliverable is the GitHub Release.
+#
+# Optimization flags are injected through hooks the makefiles already provide
+# (no source/makefile edits; see comments per job). x86-64 targets use the
+# x86-64-v3 baseline (AVX2/BMI2/FMA/LZCNT/MOVBE/F16C — needs Intel Haswell
+# 2013+ / AMD Zen 2017+); arm64 uses the Apple Silicon feature set
+# (CRC/AES/SHA crypto extensions).
+
+name: Nightly 7zz console
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows 10/11 x64 — MSVC (cl + ml64 from Build.mak).
+  # MSVC has no "-march=x86-64-v3" switch; its equivalent is /arch:AVX2.
+  # Injection points (CPP/Build.mak):
+  #   * CFLAGS_O1 / CFLAGS_O2 — overridden on the nmake command line.
+  #     "$(CFLAGS)" inside the value expands to Build.mak's full flag chain
+  #     (-MT -EHsc -GS- ...), and the trailing /O2 upgrades the /O1 that
+  #     Build.mak otherwise uses for C++ objects (C objects already use /O2).
+  #   * LFLAGS env var — prepended to the linker flag chain (adds /LTCG, so
+  #     /GL whole-program optimization can do cross-module inlining).
+  # /arch:AVX2  — v3 instruction set (AVX/AVX2/BMI/BMI2/FMA/LZCNT/MOVBE/F16C)
+  # /GL + /LTCG — whole-program optimization at compile and link time
+  # /Gw /Zc:inline — unreferenced COMDAT/global-data elimination
+  # /Oi — intrinsics; /O2 — implies /Og /Oi /Ot /Oy /Ob2 /GF /Gy per MSVC docs
+  # ---------------------------------------------------------------------------
+  windows-x64:
+    name: Windows x64 (MSVC, /arch:AVX2 = x86-64-v3)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build 7zz.exe
+        shell: cmd
+        working-directory: CPP/7zip/Bundles/Alone2
+        env:
+          LFLAGS: /LTCG
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (echo Visual Studio installation not found & exit /b 1)
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          nmake /NOLOGO -f makefile PLATFORM=x64 CFLAGS_O1="$(CFLAGS) /arch:AVX2 /GL /Gw /Zc:inline /Oi /O2" CFLAGS_O2="$(CFLAGS) /arch:AVX2 /GL /Gw /Zc:inline /Oi /O2"
+
+      - name: Smoke test
+        shell: cmd
+        working-directory: CPP/7zip/Bundles/Alone2/x64
+        run: 7zz.exe i | findstr /C:"7-Zip"
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item CPP/7zip/Bundles/Alone2/x64/7zz.exe dist/
+          Copy-Item DOC/License.txt dist/
+
+      - name: Upload (transport to release job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7zz-windows-x64-v3
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux x64 — GCC 15 (default on ubuntu-26.04) with the x86-64-v3
+  # micro-architecture level.
+  # Injection points (CPP/7zip/7zip_gcc.mak):
+  #   * MY_ARCH — prepended to CFLAGS, CXXFLAGS and the link line.
+  #   * FLAGS_FLTO — appears AFTER the makefile's built-in "-O2" in every
+  #     compile command and is also passed to the link command, so the
+  #     trailing "-O3" wins and -flto is enabled at compile AND link time.
+  #   * LDFLAGS_STATIC_3 — extra link flags; -static-libstdc++ keeps the
+  #     binary usable on older distros, -Wl,--gc-sections drops unreferenced
+  #     sections left behind by -ffunction-sections/-fdata-sections.
+  #   * CFLAGS_WARN_WALL — the makefile defaults to "-Werror -Wall -Wextra";
+  #     dropping -Werror keeps warnings visible without letting a newer GCC
+  #     major version fail the build.
+  # ---------------------------------------------------------------------------
+  linux-x64:
+    name: Linux x64 (GCC, -march=x86-64-v3)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build 7zz
+        working-directory: CPP/7zip/Bundles/Alone2
+        run: |
+          make -j"$(nproc)" -f makefile.gcc \
+            MY_ARCH="-march=x86-64-v3" \
+            FLAGS_FLTO="-O3 -flto=auto -fno-semantic-interposition -ffunction-sections -fdata-sections" \
+            LDFLAGS_STATIC_3="-static-libstdc++ -Wl,--gc-sections" \
+            CFLAGS_WARN_WALL="-Wall -Wextra"
+          file _o/7zz
+          ./_o/7zz i | grep -m1 "7-Zip"
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp CPP/7zip/Bundles/Alone2/_o/7zz dist/
+          cp DOC/License.txt dist/
+
+      - name: Upload (transport to release job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7zz-linux-x64-v3
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon runner, macos-26 image) — Apple clang 21.
+  #   * MY_ARCH="-arch arm64 -mcpu=apple-m1" — arm64 with the Apple M-series
+  #     feature set (the ARM64 counterpart of x86-64-v3: CRC/AES/SHA crypto
+  #     extensions etc.); binaries run on all Apple Silicon Macs.
+  #   * FLAGS_FLTO="-O3 -flto=thin" — same trick as the Linux job; ThinLTO is
+  #     clang's recommended LTO mode (parallel linking, same code quality).
+  #   * CC=clang / CXX=clang++ — explicit, so the makefile skips its GCC-only
+  #     "-s" strip flag; we strip with the macOS strip tool instead.
+  # ---------------------------------------------------------------------------
+  macos-arm64:
+    name: macOS arm64 (Apple clang, -mcpu=apple-m1)
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build 7zz
+        working-directory: CPP/7zip/Bundles/Alone2
+        run: |
+          make -j"$(sysctl -n hw.ncpu)" -f makefile.gcc \
+            CC=clang CXX=clang++ \
+            MY_ARCH="-arch arm64 -mcpu=apple-m1" \
+            FLAGS_FLTO="-O3 -flto=thin" \
+            CFLAGS_WARN_WALL="-Wall -Wextra"
+          strip _o/7zz
+          file _o/7zz
+          ./_o/7zz i | grep -m1 "7-Zip"
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp CPP/7zip/Bundles/Alone2/_o/7zz dist/
+          cp DOC/License.txt dist/
+
+      - name: Upload (transport to release job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7zz-macos-arm64
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Package the three binaries (zip for Windows, tar.gz for the Unix binaries
+  # so the executable bit survives) and publish ONE rolling GitHub Release
+  # tagged "nightly" — the previous nightly release is deleted first, so the
+  # tag always marks the latest nightly build. zip/tar/sha256sum/gh are all
+  # preinstalled on the ubuntu-26.04 image.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish nightly release
+    needs: [windows-x64, linux-x64, macos-arm64]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout (full history, for release notes)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: pkgs
+
+      - name: Package and hash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          DATE_STAMP="$(date -u '+%Y-%m-%d')"
+          BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          BASE_VERSION="$(sed -n 's/^#define MY_VERSION_NUMBERS "\(.*\)"/\1/p' C/7zVersion.h)"
+
+          mkdir -p release-out
+          (cd "pkgs/7zz-windows-x64-v3" && zip -9 -q "../../release-out/7zz-windows-x64-v3-${SHORT_SHA}-${DATE_STAMP}.zip" 7zz.exe License.txt)
+          tar -czf "release-out/7zz-linux-x64-v3-${SHORT_SHA}-${DATE_STAMP}.tar.gz" -C "pkgs/7zz-linux-x64-v3" 7zz License.txt
+          tar -czf "release-out/7zz-macos-arm64-${SHORT_SHA}-${DATE_STAMP}.tar.gz" -C "pkgs/7zz-macos-arm64" 7zz License.txt
+
+          {
+            echo "SHORT_SHA=${SHORT_SHA}"
+            echo "DATE_STAMP=${DATE_STAMP}"
+            echo "BUILD_DATE=${BUILD_DATE}"
+            echo "BASE_VERSION=${BASE_VERSION}"
+          } >> "$GITHUB_ENV"
+
+          ls -la release-out/
+
+      - name: Build release notes
+        run: |
+          PREV="$(git rev-parse -q --verify refs/tags/nightly || true)"
+          if [ -n "$PREV" ]; then
+            CHANGES="$(git log --pretty=format:'* %s (%h)' "${PREV}..${GITHUB_SHA}" | head -20)"
+          else
+            CHANGES="$(git log -10 --pretty=format:'* %s (%h)')"
+          fi
+          if [ -z "$CHANGES" ]; then
+            CHANGES="* No new commits since the previous nightly; rebuilt with current toolchains."
+          fi
+
+          cat > body.md <<EOF
+          **Rolling Release**
+          * **Base Version:** \`${BASE_VERSION}\`
+          * **Build Number:** #${GITHUB_RUN_NUMBER}
+          * **Branch:** [\`${GITHUB_REF_NAME}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME})
+          * **Commit:** [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
+          * **Built on:** ${BUILD_DATE}
+
+          ## 📝 Recent Changes
+          ${CHANGES}
+
+          ## 🔐 File Hashes
+          EOF
+
+          for f in release-out/*; do
+            {
+              echo "* \`$(basename "$f")\`"
+              echo "  - SHA-256: \`$(sha256sum "$f" | cut -d' ' -f1)\`"
+              echo "  - SHA-512: \`$(sha512sum "$f" | cut -d' ' -f1)\`"
+            } >> body.md
+          done
+
+      - name: Delete previous nightly release
+        run: gh release delete nightly --cleanup-tag --yes || true
+
+      - name: Create nightly release
+        run: |
+          gh release create nightly \
+            --title "Nightly Release (build #${GITHUB_RUN_NUMBER})" \
+            --notes-file body.md \
+            --prerelease \
+            --target "${GITHUB_SHA}" \
+            release-out/*
+
+      - name: Remove transport artifacts
+        run: |
+          IDS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+                  --paginate \
+                  --jq ".artifacts[] | select(.workflow_run.id == ${GITHUB_RUN_ID}) | .id")"
+          for id in $IDS; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/$id"
+          done
