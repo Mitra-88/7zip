@@ -6,7 +6,18 @@
 # Triggers:
 #   * push       — every commit to main
 #   * schedule   — every day at 03:00 UTC (nightly)
-#   * workflow_dispatch — manual trigger (Actions tab -> Run workflow)
+#   * workflow_dispatch — manual trigger (Actions tab -> Run workflow);
+#                         input `force` rebuilds even when nothing changed
+#
+# Change gate (job `changes`): the build only runs when something that can
+# affect the binaries changed since the commit the last `nightly` release was
+# built from. That commit is the target of the `nightly` tag, which the release
+# job creates. Git history, i.e. the commit, is the record of "a change in the
+# repo" — comparing against it means a scheduled run with no new commits, or a
+# push that only touched documentation, costs a few seconds instead of a full
+# three-platform rebuild + release. Documentation (DOC/, *.md) is excluded;
+# workflow files are not, because editing them changes how the binary is built
+# and should therefore be exercised by a real run.
 #
 # Runners are pinned to the documented images:
 #   * windows-2025  — VS Enterprise 2026 18.9 (MSVC 14.51 toolset)
@@ -15,10 +26,15 @@
 # Nothing needs to be installed on any runner.
 #
 # Toolchains: Windows = MSVC (cl), Linux = GCC, macOS = Apple clang.
-# Compiler option references:
+# Every flag below is taken from the official compiler references, which are
+# also mirrored locally in AI-Agents-Docs/:
 #   MSVC : https://learn.microsoft.com/en-us/cpp/build/reference/compiler-options
+#          (/O1 /O2, /Ob, /Oi, /Ot, /Oy, /arch, /GL, /Gw, /Zc:inline, /favor)
 #   Clang: https://clang.llvm.org/docs/ClangCommandLineReference.html
+#          (plus clang/docs/CommandGuide/clang.md for -mcpu/-march handling)
 #   GCC  : https://gcc.gnu.org/onlinedocs/
+#          (Optimize Options, Code Gen Options, Overall Options, x86 Options,
+#           Link Options)
 #
 # The three build jobs hand their binaries to the release job via short-lived
 # transport artifacts (1 day retention, deleted again once the release is
@@ -41,6 +57,11 @@ on:
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if nothing changed since the last nightly release
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -53,25 +74,105 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Change gate. Compares HEAD with the commit the current `nightly` release
+  # was built from and publishes the answer as the `build` output. Paths that
+  # cannot change the binary (DOC/, *.md) are ignored; if the tag or the diff is
+  # unavailable the build runs, so a failure here never blocks a legitimate
+  # build.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    if: github.repository == 'Mitra-88/7zip'
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+
+      - name: Compare HEAD against the last nightly build
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "Manual run with force=true -> building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BASE="$(git rev-list -n 1 refs/tags/nightly 2>/dev/null || true)"
+          if [ -z "$BASE" ]; then
+            echo "No previous 'nightly' release tag -> building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Last built commit: $BASE"
+
+          if [ "$BASE" = "$GITHUB_SHA" ]; then
+            echo "HEAD is already the commit the last nightly was built from -> nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED="$(git diff --name-only "$BASE" "$GITHUB_SHA" -- . \
+                       ':(exclude)DOC' ':(exclude)*.md' 2>/dev/null || echo FORCE)"
+
+          if [ "$CHANGED" = "FORCE" ]; then
+            echo "Could not diff $BASE..$GITHUB_SHA -> building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "Only DOC/ or *.md paths changed since the last nightly -> skipping the build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed paths since the last nightly:"
+            echo "$CHANGED"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
   # Windows 10/11 x64 — MSVC (cl + ml64 from Build.mak).
-  # MSVC has no "-march=x86-64-v3" switch; its equivalent is /arch:AVX2.
+  # MSVC has no "-march=x86-64-v3" switch; the x64 target for that instruction
+  # set is /arch:AVX2, which per the /arch (x64) doc covers AVX2 plus the BMI
+  # class of non-vector instructions. /favor is left at its documented default
+  # (/favor:blend) because the binary must run well on both Intel and AMD v3
+  # CPUs — /favor:INTEL64 and /favor:AMD64 each document worse performance on
+  # the other vendor.
   # Injection points (CPP/Build.mak):
   #   * CFLAGS_O1 / CFLAGS_O2 — overridden on the nmake command line.
   #     "$(CFLAGS)" inside the value expands to Build.mak's full flag chain
-  #     (-MT -EHsc -GS- ...), and the trailing /O2 upgrades the /O1 that
+  #     (-MT -EHsc -GS- -Gy ...), and the trailing /O2 upgrades the /O1 that
   #     Build.mak otherwise uses for C++ objects (C objects already use /O2).
-  #   * LFLAGS env var — prepended to the linker flag chain (adds /LTCG, so
-  #     /GL whole-program optimization can do cross-module inlining).
-  # /arch:AVX2  — v3 instruction set (AVX/AVX2/BMI/BMI2/FMA/LZCNT/MOVBE/F16C)
-  # /GL + /LTCG — whole-program optimization at compile and link time
-  # /Gw /Zc:inline — unreferenced COMDAT/global-data elimination
-  # /Oi — intrinsics; /O2 — implies /Og /Oi /Ot /Oy /Ob2 /GF /Gy per MSVC docs
+  #   * LFLAGS env var — prepended to the linker flag chain (adds /LTCG).
+  # /O2 — documented as equivalent to /Og /Oi /Ot /Oy /Ob2 /GF /Gy; /Oy is
+  #       x86-only ("in x64 compilers /Oy and /Oy- aren't available"), so on
+  #       x64 the effective set is /Og /Oi /Ot /Ob2 /GF /Gy. /Ob2 and /Gy come
+  #       from it, /Gy is also set explicitly by Build.mak.
+  # /Ob3 — more aggressive inlining than the /Ob2 that /O2 implies (VS2019+;
+  #       the image ships VS2026). The documented target here is speed.
+  # /arch:AVX2 — v3 instruction set (AVX/AVX2/BMI/BMI2/FMA/LZCNT/MOVBE/F16C)
+  # /GL + /LTCG — whole-program optimization at compile and link time (cross-
+  #       module inlining, register allocation across function boundaries,
+  #       better global-data tracking)
+  # /Gw — per-item COMDAT global data; with /GL the linker drops unreferenced
+  #       global data and merges identical read-only data, using the /OPT:REF
+  #       and /OPT:ICF that Build.mak already passes to link
+  # /Zc:inline is deliberately NOT passed: the doc states it is not enabled
+  #       when /GL is specified, which already does better COMDAT elimination.
   # ---------------------------------------------------------------------------
   windows-x64:
     name: Windows x64 (MSVC, /arch:AVX2 = x86-64-v3)
+    needs: changes
     runs-on: windows-2025
     timeout-minutes: 30
-    if: github.repository == 'Mitra-88/7zip'
+    if: github.repository == 'Mitra-88/7zip' && needs.changes.outputs.build == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -85,7 +186,7 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           if not defined VSINSTALL (echo Visual Studio installation not found & exit /b 1)
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          nmake /NOLOGO -f makefile PLATFORM=x64 CFLAGS_O1="$(CFLAGS) /arch:AVX2 /GL /Gw /Zc:inline /Oi /O2" CFLAGS_O2="$(CFLAGS) /arch:AVX2 /GL /Gw /Zc:inline /Oi /O2"
+          nmake /NOLOGO -f makefile PLATFORM=x64 CFLAGS_O1="$(CFLAGS) /arch:AVX2 /GL /Gw /Ob3 /O2" CFLAGS_O2="$(CFLAGS) /arch:AVX2 /GL /Gw /Ob3 /O2"
 
       - name: Smoke test
         shell: cmd
@@ -112,21 +213,53 @@ jobs:
   # micro-architecture level.
   # Injection points (CPP/7zip/7zip_gcc.mak):
   #   * MY_ARCH — prepended to CFLAGS, CXXFLAGS and the link line.
+  #     "-march=x86-64-v3" selects the x86-64 psABI level (per the x86 Options
+  #     doc it also implies generic tuning; no -mtune is set because the binary
+  #     has to run well on every v3 CPU from any vendor, and the same doc warns
+  #     that tuning for one CPU can hurt others).
   #   * FLAGS_FLTO — appears AFTER the makefile's built-in "-O2" in every
-  #     compile command and is also passed to the link command, so the
-  #     trailing "-O3" wins and -flto is enabled at compile AND link time.
-  #   * LDFLAGS_STATIC_3 — extra link flags; -static-libstdc++ keeps the
-  #     binary usable on older distros, -Wl,--gc-sections drops unreferenced
-  #     sections left behind by -ffunction-sections/-fdata-sections.
+  #     compile command (CFLAGS and CXXFLAGS) and is also passed to the link
+  #     command, so the trailing "-O3" wins and the LTO/section flags apply at
+  #     compile AND link time.
+  #   * LDFLAGS_STATIC_3 — extra link flags.
   #   * CFLAGS_WARN_WALL — the makefile defaults to "-Werror -Wall -Wextra";
   #     dropping -Werror keeps warnings visible without letting a newer GCC
   #     major version fail the build.
+  # Flag notes (GCC doc page in brackets):
+  #   -O3            [Optimize Options] all -O2 passes plus loop interchange,
+  #                  predictive commoning, partial inlining, peeling, dynamic
+  #                  vector cost model, ...
+  #   -flto=auto     [Optimize Options] whole-program optimization with the
+  #                  link step run in parallel (GNU make jobserver when
+  #                  available, otherwise CPU-count autodetection)
+  #   -pipe          [Overall Options] pipes instead of temporary files between
+  #                  compiler stages — build speed, no effect on the output
+  #   -fno-semantic-interposition  [Optimize Options] the compiler may
+  #                  inline/propagate exported symbols instead of assuming the
+  #                  dynamic linker can replace them — matters because
+  #                  CFLAGS_BASE compiles with -fPIC
+  #   -fno-plt       [Code Gen Options] call through GOT loads instead of PLT
+  #                  stubs, which exposes the address loads to optimization;
+  #                  all external symbols then bind at load time (lazy binding
+  #                  is not needed for this binary)
+  #   -ffunction-sections -fdata-sections [Optimize Options] one section per
+  #                  function/data item; the same doc states these pay off
+  #                  together with the linker's --gc-sections
+  #   -static-libstdc++ [Link Options] freezes libstdc++ into the binary, so
+  #                  it runs on distributions older than the build image
+  #   -Wl,--gc-sections [Optimize Options: linker garbage collection] drops the
+  #                  sections nothing references
+  # Already provided by the makefile and therefore not repeated here: -O2
+  # (upgraded to -O3 by FLAGS_FLTO), -DNDEBUG, -fPIC, -s (strip),
+  # -z noexecstack. -foptimize-crc, which the docs list among the -O2 flags,
+  # is thus already on for the CRC-heavy codec paths.
   # ---------------------------------------------------------------------------
   linux-x64:
     name: Linux x64 (GCC, -march=x86-64-v3)
+    needs: changes
     runs-on: ubuntu-26.04
     timeout-minutes: 30
-    if: github.repository == 'Mitra-88/7zip'
+    if: github.repository == 'Mitra-88/7zip' && needs.changes.outputs.build == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -136,7 +269,7 @@ jobs:
         run: |
           make -j"$(nproc)" -f makefile.gcc \
             MY_ARCH="-march=x86-64-v3" \
-            FLAGS_FLTO="-O3 -flto=auto -fno-semantic-interposition -ffunction-sections -fdata-sections" \
+            FLAGS_FLTO="-O3 -flto=auto -pipe -fno-semantic-interposition -fno-plt -ffunction-sections -fdata-sections" \
             LDFLAGS_STATIC_3="-static-libstdc++ -Wl,--gc-sections" \
             CFLAGS_WARN_WALL="-Wall -Wextra"
           file _o/7zz
@@ -158,19 +291,28 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # macOS arm64 (Apple Silicon runner, macos-26 image) — Apple clang 21.
+  # Injection points are the same as the Linux job (MY_ARCH, FLAGS_FLTO).
   #   * MY_ARCH="-arch arm64 -mcpu=apple-m1" — arm64 with the Apple M-series
   #     feature set (the ARM64 counterpart of x86-64-v3: CRC/AES/SHA crypto
-  #     extensions etc.); binaries run on all Apple Silicon Macs.
+  #     extensions etc.), matching the MACOSX_DEPLOYMENT_TARGET below: macOS 11
+  #     is the oldest release that runs on Apple Silicon, so no Apple Silicon
+  #     Mac is excluded. -mcpu implies the matching -mtune.
   #   * FLAGS_FLTO="-O3 -flto=thin" — same trick as the Linux job; ThinLTO is
-  #     clang's recommended LTO mode (parallel linking, same code quality).
+  #     clang's recommended LTO mode (parallel linking, same code quality). On
+  #     a single-executable link it also lets LLVM internalize and drop what
+  #     nothing calls, which is the Mach-O answer to --gc-sections.
   #   * CC=clang / CXX=clang++ — explicit, so the makefile skips its GCC-only
   #     "-s" strip flag; we strip with the macOS strip tool instead.
+  # No -ffunction-sections/-fdata-sections or -Wl,-dead_strip here: the Mach-O
+  # object format and Apple's ld don't pair them the way ELF/--gc-sections
+  # does, and the provided clang reference doesn't document them for Darwin.
   # ---------------------------------------------------------------------------
   macos-arm64:
     name: macOS arm64 (Apple clang, -mcpu=apple-m1)
+    needs: changes
     runs-on: macos-26
     timeout-minutes: 30
-    if: github.repository == 'Mitra-88/7zip'
+    if: github.repository == 'Mitra-88/7zip' && needs.changes.outputs.build == 'true'
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
@@ -207,15 +349,16 @@ jobs:
   # Package the three binaries (zip for Windows, tar.gz for the Unix binaries
   # so the executable bit survives) and publish ONE rolling GitHub Release
   # tagged "nightly" — the previous nightly release is deleted first, so the
-  # tag always marks the latest nightly build. zip/tar/sha256sum/gh are all
-  # preinstalled on the ubuntu-26.04 image.
+  # tag always marks the latest nightly build (and is what the `changes` job
+  # compares against on the next run).
+  # zip/tar/sha256sum/gh are all preinstalled on the ubuntu-26.04 image.
   # ---------------------------------------------------------------------------
   release:
     name: Publish nightly release
-    needs: [windows-x64, linux-x64, macos-arm64]
+    needs: [changes, windows-x64, linux-x64, macos-arm64]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
-    if: github.repository == 'Mitra-88/7zip'
+    if: github.repository == 'Mitra-88/7zip' && needs.changes.outputs.build == 'true'
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
