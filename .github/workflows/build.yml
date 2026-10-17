@@ -44,10 +44,14 @@
 # Mitra-88/7zip build binaries and publish releases.
 #
 # Optimization flags are injected through hooks the makefiles already provide
-# (no source/makefile edits; see comments per job). x86-64 targets use the
-# x86-64-v3 baseline (AVX2/BMI2/FMA/LZCNT/MOVBE/F16C — needs Intel Haswell
-# 2013+ / AMD Zen 2017+); arm64 uses the Apple Silicon feature set
-# (CRC/AES/SHA crypto extensions).
+# (no source/makefile edits; see comments per job). Under GCC and clang the
+# x86-64 targets use the x86-64-v3 micro-architecture level of the x86-64
+# psABI — the clang reference spells the level out as AVX, AVX2, BMI1, BMI2,
+# F16C, FMA, LZCNT, MOVBE, XSAVE (needs Intel Haswell 2013+ / AMD Zen 2017+).
+# MSVC has no equivalent switch: /arch:AVX2 is the closest documented x64
+# option and is described there as AVX2 plus FMA and "certain BMI
+# instructions", not as the whole psABI level. arm64 targets the Apple M-series
+# level (apple-m1).
 
 name: Nightly 7zz console
 
@@ -139,17 +143,17 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Windows 10/11 x64 — MSVC (cl + ml64 from Build.mak).
-  # MSVC has no "-march=x86-64-v3" switch; the x64 target for that instruction
-  # set is /arch:AVX2, which per the /arch (x64) doc covers AVX2 plus the BMI
-  # class of non-vector instructions. /favor is left at its documented default
-  # (/favor:blend) because the binary must run well on both Intel and AMD v3
-  # CPUs — /favor:INTEL64 and /favor:AMD64 each document worse performance on
-  # the other vendor.
+  # MSVC has no "-march=x86-64-v3" switch, so /arch:AVX2 stands in for it; see
+  # the /arch:AVX2 note below for how far that equivalence is documented to go.
+  # /favor is left at its documented default (/favor:blend) because the binary
+  # must run well on both Intel and AMD v3 CPUs — /favor:INTEL64 and
+  # /favor:AMD64 each document worse performance on the other vendor.
   # Injection points (CPP/Build.mak):
   #   * CFLAGS_O1 / CFLAGS_O2 — overridden on the nmake command line.
   #     "$(CFLAGS)" inside the value expands to Build.mak's full flag chain
-  #     (-MT -EHsc -GS- -Gy ...), and the trailing /O2 upgrades the /O1 that
-  #     Build.mak otherwise uses for C++ objects (C objects already use /O2).
+  #     (-MT -EHsc -GS- -Gy, all visible on the echoed cl lines in the log),
+  #     and the trailing /O2 upgrades the /O1 that chain otherwise ends in for
+  #     most C++ objects; Compress/, Crypto/ and the C sources already use /O2.
   #   * LFLAGS env var — prepended to the linker flag chain (adds /LTCG).
   # /O2 — documented as equivalent to /Og /Oi /Ot /Oy /Ob2 /GF /Gy; /Oy is
   #       x86-only ("in x64 compilers /Oy and /Oy- aren't available"), so on
@@ -157,7 +161,10 @@ jobs:
   #       from it, /Gy is also set explicitly by Build.mak.
   # /Ob3 — more aggressive inlining than the /Ob2 that /O2 implies (VS2019+;
   #       the image ships VS2026). The documented target here is speed.
-  # /arch:AVX2 — v3 instruction set (AVX/AVX2/BMI/BMI2/FMA/LZCNT/MOVBE/F16C)
+  # /arch:AVX2 — closest documented x64 equivalent of the x86-64-v3 level:
+  #       the /arch (x64) page names AVX2 plus FMA and "certain BMI
+  #       instructions". MSVC does not define this switch in psABI-level terms,
+  #       so F16C/LZCNT/MOVBE/XSAVE are not implied by the documentation.
   # /GL + /LTCG — whole-program optimization at compile and link time (cross-
   #       module inlining, register allocation across function boundaries,
   #       better global-data tracking)
@@ -168,7 +175,7 @@ jobs:
   #       when /GL is specified, which already does better COMDAT elimination.
   # ---------------------------------------------------------------------------
   windows-x64:
-    name: Windows x64 (MSVC, /arch:AVX2 = x86-64-v3)
+    name: Windows x64 (MSVC, /arch:AVX2)
     needs: changes
     runs-on: windows-2025
     timeout-minutes: 30
@@ -213,10 +220,12 @@ jobs:
   # micro-architecture level.
   # Injection points (CPP/7zip/7zip_gcc.mak):
   #   * MY_ARCH — prepended to CFLAGS, CXXFLAGS and the link line.
-  #     "-march=x86-64-v3" selects the x86-64 psABI level (per the x86 Options
-  #     doc it also implies generic tuning; no -mtune is set because the binary
-  #     has to run well on every v3 CPU from any vendor, and the same doc warns
-  #     that tuning for one CPU can hurt others).
+  #     "-march=x86-64-v3" selects the x86-64 psABI micro-architecture level.
+  #     The x86 Options page notes these level values have no matching -mtune
+  #     setting and therefore enable generic tuning, and that specific tuning
+  #     needs -mtune=<cpu> for a CPU that has to be known — so none is passed:
+  #     the whole point of the level is to run on every v3 CPU of either
+  #     vendor.
   #   * FLAGS_FLTO — appears AFTER the makefile's built-in "-O2" in every
   #     compile command (CFLAGS and CXXFLAGS) and is also passed to the link
   #     command, so the trailing "-O3" wins and the LTO/section flags apply at
@@ -224,20 +233,26 @@ jobs:
   #   * LDFLAGS_STATIC_3 — extra link flags.
   #   * CFLAGS_WARN_WALL — the makefile defaults to "-Werror -Wall -Wextra";
   #     dropping -Werror keeps warnings visible without letting a newer GCC
-  #     major version fail the build.
+  #     major version fail the build. GCC 15 does emit one -Wstringop-overflow=
+  #     warning from upstream Rar3Decoder.cpp on a write whose loop is
+  #     bounds-checked, i.e. exactly the kind of diagnostic that must not stop
+  #     a release.
   # Flag notes (GCC doc page in brackets):
-  #   -O3            [Optimize Options] all -O2 passes plus loop interchange,
-  #                  predictive commoning, partial inlining, peeling, dynamic
-  #                  vector cost model, ...
+  #   -O3            [Optimize Options] all -O2 passes plus, among others, loop
+  #                  interchange and unrolling-and-jamming, loop distribution,
+  #                  loop unswitching, predictive commoning, peeling, splitting
+  #                  paths and the dynamic vector cost model
   #   -flto=auto     [Optimize Options] whole-program optimization with the
   #                  link step run in parallel (GNU make jobserver when
   #                  available, otherwise CPU-count autodetection)
   #   -pipe          [Overall Options] pipes instead of temporary files between
   #                  compiler stages — build speed, no effect on the output
-  #   -fno-semantic-interposition  [Optimize Options] the compiler may
-  #                  inline/propagate exported symbols instead of assuming the
-  #                  dynamic linker can replace them — matters because
-  #                  CFLAGS_BASE compiles with -fPIC
+  #   -fno-semantic-interposition  [Optimize Options] without it the compiler
+  #                  cannot propagate, inline or otherwise optimize a symbol
+  #                  exported from a DSO, since the dynamic linker may replace
+  #                  it; this flag lets it assume the replacement would have
+  #                  the same semantics. Relevant because CFLAGS_BASE compiles
+  #                  with -fPIC.
   #   -fno-plt       [Code Gen Options] call through GOT loads instead of PLT
   #                  stubs, which exposes the address loads to optimization;
   #                  all external symbols then bind at load time (lazy binding
@@ -292,20 +307,30 @@ jobs:
   # ---------------------------------------------------------------------------
   # macOS arm64 (Apple Silicon runner, macos-26 image) — Apple clang 21.
   # Injection points are the same as the Linux job (MY_ARCH, FLAGS_FLTO).
-  #   * MY_ARCH="-arch arm64 -mcpu=apple-m1" — arm64 with the Apple M-series
-  #     feature set (the ARM64 counterpart of x86-64-v3: CRC/AES/SHA crypto
-  #     extensions etc.), matching the MACOSX_DEPLOYMENT_TARGET below: macOS 11
-  #     is the oldest release that runs on Apple Silicon, so no Apple Silicon
-  #     Mac is excluded. -mcpu implies the matching -mtune.
-  #   * FLAGS_FLTO="-O3 -flto=thin" — same trick as the Linux job; ThinLTO is
-  #     clang's recommended LTO mode (parallel linking, same code quality). On
-  #     a single-executable link it also lets LLVM internalize and drop what
-  #     nothing calls, which is the Mach-O answer to --gc-sections.
+  #   * MY_ARCH="-arch arm64 -mcpu=apple-m1" — arm64 at the Apple M-series
+  #     level, the ARM64 counterpart of picking an x86-64 micro-architecture
+  #     level: on macOS the CPU is always an Apple core, so the level is named
+  #     directly instead of through a psABI ladder. apple-m1 is a documented
+  #     -mcpu value — clang's reference sends you to -mcpu=help /
+  #     --print-supported-cpus for the list, and --print-enabled-extensions,
+  #     documented for AArch64 only, prints the extensions a given -mcpu turns
+  #     on; GCC's AArch64 page carries the matching crc / crypto / aes feature
+  #     names. This pairs with the MACOSX_DEPLOYMENT_TARGET below: macOS 11 is
+  #     the oldest release that runs on Apple Silicon, so no Apple Silicon Mac
+  #     is excluded.
+  #   * FLAGS_FLTO="-O3 -flto=thin" — same trick as the Linux job. The clang
+  #     ThinLTO page describes it as scalable and incremental because the thin
+  #     link reads module summaries instead of merging modules, after which the
+  #     cross-module optimization backends run in parallel threads; it lists
+  #     ld64, Xcode 8 and later, among the supported linkers, and reports
+  #     results that match full LTO's performance improvement in many cases.
   #   * CC=clang / CXX=clang++ — explicit, so the makefile skips its GCC-only
   #     "-s" strip flag; we strip with the macOS strip tool instead.
-  # No -ffunction-sections/-fdata-sections or -Wl,-dead_strip here: the Mach-O
-  # object format and Apple's ld don't pair them the way ELF/--gc-sections
-  # does, and the provided clang reference doesn't document them for Darwin.
+  # No -ffunction-sections/-fdata-sections, -Wl,--gc-sections or -Wl,-dead_strip
+  # here: the GCC page pairs the first two with the linker's --gc-sections, and
+  # neither that option nor Mach-O's -dead_strip is documented in the clang
+  # reference, so nothing Darwin-specific is guessed at here. ThinLTO does the
+  # whole-program work instead.
   # ---------------------------------------------------------------------------
   macos-arm64:
     name: macOS arm64 (Apple clang, -mcpu=apple-m1)
