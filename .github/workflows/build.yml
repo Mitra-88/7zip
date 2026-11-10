@@ -193,12 +193,27 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           if not defined VSINSTALL (echo Visual Studio installation not found & exit /b 1)
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          nmake /NOLOGO -f makefile PLATFORM=x64 CFLAGS_O1="$(CFLAGS) /arch:AVX2 /GL /Gw /Ob3 /O2" CFLAGS_O2="$(CFLAGS) /arch:AVX2 /GL /Gw /Ob3 /O2"
+          nmake /NOLOGO -f makefile PLATFORM=x64 CFLAGS_O1="$(CFLAGS) /arch:AVX2 /GL /Gw /Ob3 /O2" CFLAGS_O2="$(CFLAGS) /arch:AVX2 /GL /Gw /Ob3 /O2" > build.log 2>&1
+          if errorlevel 1 exit /b 1
 
-      - name: Smoke test
+      - name: Round-trip benchmark
         shell: cmd
         working-directory: CPP/7zip/Bundles/Alone2/x64
-        run: 7zz.exe i | findstr /C:"7-Zip"
+        run: 7zz.exe b -md22 -mtic=31 -mmt2 -bt
+
+      - name: Show build log (on failure)
+        if: failure()
+        shell: pwsh
+        run: Get-Content CPP/7zip/Bundles/Alone2/build.log -Tail 100
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-log-windows-x64
+          path: CPP/7zip/Bundles/Alone2/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Stage artifact
         shell: pwsh
@@ -282,13 +297,23 @@ jobs:
       - name: Build 7zz
         working-directory: CPP/7zip/Bundles/Alone2
         run: |
+          set -o pipefail
           make -j"$(nproc)" -f makefile.gcc \
             MY_ARCH="-march=x86-64-v3" \
             FLAGS_FLTO="-O3 -flto=auto -pipe -fno-semantic-interposition -fno-plt -ffunction-sections -fdata-sections" \
             LDFLAGS_STATIC_3="-static-libstdc++ -Wl,--gc-sections" \
-            CFLAGS_WARN_WALL="-Wall -Wextra"
+            CFLAGS_WARN_WALL="-Wall -Wextra" 2>&1 | tee build.log
           file _o/7zz
-          ./_o/7zz i | grep -m1 "7-Zip"
+          ./_o/7zz b -md22 -mtic=31 -mmt2 -bt
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-log-linux-x64
+          path: CPP/7zip/Bundles/Alone2/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Stage artifact
         run: |
@@ -347,14 +372,24 @@ jobs:
       - name: Build 7zz
         working-directory: CPP/7zip/Bundles/Alone2
         run: |
+          set -o pipefail
           make -j"$(sysctl -n hw.ncpu)" -f makefile.gcc \
             CC=clang CXX=clang++ \
             MY_ARCH="-arch arm64 -mcpu=apple-m1" \
             FLAGS_FLTO="-O3 -flto=thin" \
-            CFLAGS_WARN_WALL="-Wall -Wextra"
+            CFLAGS_WARN_WALL="-Wall -Wextra" 2>&1 | tee build.log
           strip _o/7zz
           file _o/7zz
-          ./_o/7zz i | grep -m1 "7-Zip"
+          ./_o/7zz b -md22 -mtic=31 -mmt2 -bt
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-log-macos-arm64
+          path: CPP/7zip/Bundles/Alone2/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Stage artifact
         run: |
